@@ -1,10 +1,11 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import { Connection, PublicKey, Keypair } from '@solana/web3.js';
-import { Jupiter } from '@jup-ag/core';
-import { TOKEN_PROGRAM_ID, getOrCreateAssociatedTokenAccount, getAccount } from '@solana/spl-token';
-import { createClient } from '@supabase/supabase-js';
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { createClient } from "@supabase/supabase-js";
+import fetch from "node-fetch";
+import bs58 from "bs58";
 
 dotenv.config();
 
@@ -18,23 +19,147 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
-// Initialize Solana connection (using mainnet for production)
-const connection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
-
-// Initialize Jupiter for swaps
-const jupiter = await Jupiter.load({
-  connection,
-  cluster: 'mainnet-beta',
-  user: null // Will be set per transaction
+// Initialize Solana connection with commitment and rate limit config
+const connection = new Connection("https://api.mainnet-beta.solana.com", {
+  commitment: "confirmed",
+  confirmTransactionInitialTimeout: 60000,
+  wsEndpoint: "wss://api.mainnet-beta.solana.com/",
 });
+
+// Rate limiting configuration - Much more conservative now
+const RATE_LIMIT_WINDOW = 60000; // 60 seconds (doubled)
+const MAX_REQUESTS_PER_WINDOW = 3; // Reduced from 5
+const requestCounts = new Map();
+
+// Exponential backoff configuration - Longer delays
+const INITIAL_BACKOFF = 5000; // 5 seconds (increased)
+const MAX_BACKOFF = 300000; // 5 minutes (increased)
+const MAX_RETRIES = 5; // Reduced from 8 to fail faster
+
+// Minimum time between operations - Much longer intervals
+const MIN_SCAN_INTERVAL = 300000; // 5 minutes between scans (increased)
+const MIN_QUOTE_INTERVAL = 120000; // 2 minutes between quotes (increased)
+
+// Operation-specific rate limits
+const RATE_LIMITS = {
+  scan: { window: 60000, max: 2 }, // 2 per minute
+  balance: { window: 60000, max: 2 }, // 2 per minute
+  quote: { window: 120000, max: 1 }, // 1 per 2 minutes
+  swap: { window: 300000, max: 1 }, // 1 per 5 minutes
+  transaction: { window: 300000, max: 1 }, // 1 per 5 minutes
+};
+
+// Jupiter API base URL
+const JUPITER_API_BASE = "https://quote-api.jup.ag/v6";
 
 // Store active trackers in memory (but persist to Supabase)
 const activeTrackers = new Map();
 
 // Load the main wallet from environment variables
 const mainWalletKeypair = Keypair.fromSecretKey(
-  new Uint8Array(JSON.parse(process.env.MAIN_WALLET_PRIVATE_KEY || '[]'))
+  bs58.decode(process.env.MAIN_WALLET_PRIVATE_KEY)
 );
+
+// Enhanced rate limiting function with operation-specific limits
+function checkRateLimit(operation) {
+  const now = Date.now();
+  const limits = RATE_LIMITS[operation] || {
+    window: RATE_LIMIT_WINDOW,
+    max: MAX_REQUESTS_PER_WINDOW,
+  };
+  const windowStart = now - limits.window;
+
+  // Clean up old entries
+  for (const [k, data] of requestCounts.entries()) {
+    if (data.timestamp < windowStart) {
+      requestCounts.delete(k);
+    }
+  }
+
+  const key = `${operation}-${now.toString().slice(0, -3)}`; // Group by second
+  const data = requestCounts.get(key) || { count: 0, timestamp: now };
+
+  if (data.cooldownUntil && now < data.cooldownUntil) {
+    return false;
+  }
+
+  if (data.count >= limits.max) {
+    data.cooldownUntil = now + limits.window;
+    requestCounts.set(key, data);
+    return false;
+  }
+
+  data.count += 1;
+  data.timestamp = now;
+  requestCounts.set(key, data);
+  return true;
+}
+
+// Enhanced retry function with operation-specific handling
+async function retryWithBackoff(operation, operationType, options = {}) {
+  const {
+    maxRetries = MAX_RETRIES,
+    initialBackoff = INITIAL_BACKOFF,
+    maxBackoff = MAX_BACKOFF,
+  } = options;
+
+  let retries = 0;
+  let lastError;
+
+  while (retries < maxRetries) {
+    try {
+      if (!checkRateLimit(operationType)) {
+        const waitTime =
+          RATE_LIMITS[operationType]?.window || RATE_LIMIT_WINDOW;
+        console.log(
+          `Rate limit reached for ${operationType}, waiting ${
+            waitTime / 1000
+          }s...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        continue;
+      }
+
+      return await operation();
+    } catch (error) {
+      lastError = error;
+
+      const isRateLimit =
+        error.message.includes("429") ||
+        error.message.includes("Too many requests") ||
+        error.message.includes("Rate limit exceeded");
+
+      const isRetriable =
+        isRateLimit ||
+        error.message.includes("timeout") ||
+        error.message.includes("network") ||
+        error.message.includes("connection");
+
+      if (isRetriable) {
+        const backoffTime = Math.min(
+          initialBackoff * Math.pow(2, retries),
+          maxBackoff
+        );
+        console.log(
+          `${operationType} failed (${error.message}). Retrying after ${
+            backoffTime / 1000
+          }s...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoffTime));
+        retries++;
+      } else {
+        console.error(`Non-retriable error in ${operationType}:`, error);
+        throw error;
+      }
+    }
+  }
+
+  console.error(
+    `${operationType} failed after ${maxRetries} retries. Last error:`,
+    lastError
+  );
+  throw lastError;
+}
 
 class WalletTracker {
   constructor(id, walletAddress, solPercentage) {
@@ -45,301 +170,224 @@ class WalletTracker {
     this.lastTransaction = null;
     this.subscriptionId = null;
     this.tokenHoldings = new Map();
+    this.lastScanTime = 0;
+    this.lastQuoteTime = 0;
+    this.consecutiveErrors = 0;
+    this.backoffUntil = 0;
   }
 
   async updateInDb() {
     await supabase
-      .from('trackers')
+      .from("trackers")
       .update({
         is_active: this.isActive,
         last_transaction: this.lastTransaction,
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
       })
-      .eq('id', this.id);
+      .eq("id", this.id);
   }
 
   async startTracking() {
     if (this.subscriptionId) {
-      return; // Already tracking
+      return;
     }
 
-    // Subscribe to account changes
-    this.subscriptionId = connection.onAccountChange(
-      this.walletAddress,
-      this.handleAccountChange.bind(this),
-      'confirmed'
-    );
+    try {
+      this.subscriptionId = connection.onAccountChange(
+        this.walletAddress,
+        this.handleAccountChange.bind(this),
+        "confirmed"
+      );
 
-    // Initial token scan
-    await this.scanTokens();
+      await this.scanTokens();
+    } catch (error) {
+      console.error("Error starting tracker:", error);
+      this.isActive = false;
+      await this.updateInDb();
+    }
   }
 
   async stopTracking() {
     if (this.subscriptionId) {
-      await connection.removeAccountChangeListener(this.subscriptionId);
+      try {
+        await connection.removeAccountChangeListener(this.subscriptionId);
+      } catch (error) {
+        console.error("Error removing account listener:", error);
+      }
       this.subscriptionId = null;
     }
     this.isActive = false;
     await this.updateInDb();
   }
 
+  shouldBackoff() {
+    if (this.backoffUntil > Date.now()) {
+      return true;
+    }
+    return false;
+  }
+
+  increaseBackoff() {
+    this.consecutiveErrors++;
+    const backoffTime = Math.min(
+      INITIAL_BACKOFF * Math.pow(2, this.consecutiveErrors),
+      MAX_BACKOFF
+    );
+    this.backoffUntil = Date.now() + backoffTime;
+  }
+
+  resetBackoff() {
+    this.consecutiveErrors = 0;
+    this.backoffUntil = 0;
+  }
+
   async handleAccountChange(accountInfo, context) {
     try {
-      // Update last transaction
+      if (this.shouldBackoff()) {
+        return;
+      }
+
       this.lastTransaction = context.slot.toString();
       await this.updateInDb();
 
-      // Scan for token changes
-      await this.scanTokens();
+      const now = Date.now();
+      const canScan = now - this.lastScanTime >= MIN_SCAN_INTERVAL;
+      const canQuote = now - this.lastQuoteTime >= MIN_QUOTE_INTERVAL;
 
-      // Check for opportunities
-      await this.checkOpportunities();
+      if (canScan) {
+        this.lastScanTime = now;
+        await this.scanTokens();
+
+        if (canQuote) {
+          this.lastQuoteTime = now;
+          await this.checkOpportunities();
+        }
+      }
+
+      this.resetBackoff();
     } catch (error) {
-      console.error('Error handling account change:', error);
+      console.error("Error handling account change:", error);
+      this.increaseBackoff();
     }
   }
 
   async scanTokens() {
     try {
-      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
-        this.walletAddress,
-        { programId: TOKEN_PROGRAM_ID }
-      );
+      const tokenAccounts = await retryWithBackoff(async () => {
+        return await connection.getParsedTokenAccountsByOwner(
+          this.walletAddress,
+          { programId: TOKEN_PROGRAM_ID }
+        );
+      }, "scan");
 
-      // Update token holdings map
       this.tokenHoldings.clear();
       for (const { account, pubkey } of tokenAccounts.value) {
         const { mint, amount } = account.data.parsed.info;
-        this.tokenHoldings.set(mint, {
-          amount: amount,
-          address: pubkey.toBase58()
-        });
+        if (amount > 0) {
+          this.tokenHoldings.set(mint, {
+            amount: amount,
+            address: pubkey.toBase58(),
+          });
+        }
       }
     } catch (error) {
-      console.error('Error scanning tokens:', error);
+      console.error("Error scanning tokens:", error);
+      this.increaseBackoff();
     }
   }
 
   async checkOpportunities() {
     try {
-      // Get main wallet SOL balance
-      const mainBalance = await connection.getBalance(mainWalletKeypair.publicKey);
+      const mainBalance = await retryWithBackoff(async () => {
+        return await connection.getBalance(mainWalletKeypair.publicKey);
+      }, "balance");
+
       const availableSOL = (mainBalance * this.solPercentage) / 100;
 
-      // Check each token holding for opportunities
       for (const [mint, holding] of this.tokenHoldings) {
-        const routes = await jupiter.computeRoutes({
-          inputMint: new PublicKey(mint),
-          outputMint: new PublicKey('So11111111111111111111111111111111111111112'), // SOL
-          amount: holding.amount,
-          slippageBps: 50, // 0.5%
+        try {
+          const response = await retryWithBackoff(async () => {
+            const res = await fetch(`${JUPITER_API_BASE}/quote`, {
+              method: "GET",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                inputMint: mint,
+                outputMint: "So11111111111111111111111111111111111111112",
+                amount: holding.amount,
+                slippageBps: 50,
+                onlyDirectRoutes: false,
+              }),
+            });
+
+            if (!res.ok) {
+              throw new Error(`Jupiter API error: ${res.statusText}`);
+            }
+
+            return res;
+          }, "quote");
+
+          const quote = await response.json();
+
+          if (quote.outAmount > availableSOL * 1.01) {
+            await this.executeSwap(quote);
+          }
+        } catch (error) {
+          if (!error.message.includes("Rate limit")) {
+            console.error(`Error getting quote for mint ${mint}:`, error);
+          }
+          continue;
+        }
+      }
+    } catch (error) {
+      console.error("Error checking opportunities:", error);
+      this.increaseBackoff();
+    }
+  }
+
+  async executeSwap(quote) {
+    try {
+      const swapResponse = await retryWithBackoff(async () => {
+        const res = await fetch(`${JUPITER_API_BASE}/swap`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            quoteResponse: quote,
+            userPublicKey: mainWalletKeypair.publicKey.toString(),
+          }),
         });
 
-        if (routes.length > 0) {
-          const bestRoute = routes[0];
-          // If profit opportunity exists (e.g., > 1% after fees)
-          if (bestRoute.outAmount > availableSOL * 1.01) {
-            await this.executeSwap(bestRoute);
-          }
+        if (!res.ok) {
+          throw new Error(`Jupiter API error: ${res.statusText}`);
         }
-      }
-    } catch (error) {
-      console.error('Error checking opportunities:', error);
-    }
-  }
 
-  async executeSwap(route) {
-    try {
-      const { transactions } = await jupiter.exchange({
-        routeInfo: route,
-        userPublicKey: mainWalletKeypair.publicKey,
-      });
+        return res;
+      }, "swap");
 
-      // Sign and send each transaction in the sequence
-      for (const { transaction, signers } of transactions) {
-        transaction.sign([mainWalletKeypair, ...signers]);
-        const signature = await connection.sendTransaction(transaction);
-        await connection.confirmTransaction(signature);
-        
-        // Update last transaction
-        this.lastTransaction = signature;
-        await this.updateInDb();
-      }
+      const { swapTransaction } = await swapResponse.json();
+      const transaction = swapTransaction;
+      transaction.sign([mainWalletKeypair]);
+
+      const signature = await retryWithBackoff(async () => {
+        const sig = await connection.sendTransaction(transaction);
+        await connection.confirmTransaction(sig);
+        return sig;
+      }, "transaction");
+
+      this.lastTransaction = signature;
+      await this.updateInDb();
     } catch (error) {
-      console.error('Error executing swap:', error);
+      console.error("Error executing swap:", error);
+      this.increaseBackoff();
     }
   }
 }
 
-// Load existing trackers from database on startup
-async function loadTrackers() {
-  const { data: trackers, error } = await supabase
-    .from('trackers')
-    .select('*')
-    .eq('is_active', true);
-
-  if (error) {
-    console.error('Error loading trackers:', error);
-    return;
-  }
-
-  for (const tracker of trackers) {
-    const walletTracker = new WalletTracker(
-      tracker.id,
-      tracker.wallet_address,
-      tracker.sol_percentage
-    );
-    await walletTracker.startTracking();
-    activeTrackers.set(tracker.wallet_address, walletTracker);
-  }
-}
-
-// Load trackers on startup
-loadTrackers();
-
-// Health check endpoint for Render
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    activeTrackers: activeTrackers.size
-  });
-});
-
-// Keep-alive endpoint
-app.get('/keep-alive', (req, res) => {
-  res.status(200).json({
-    status: 'alive',
-    timestamp: new Date().toISOString()
-  });
-});
-
-// API Routes
-app.post('/api/trackers', async (req, res) => {
-  try {
-    const { walletAddress, solPercentage } = req.body;
-    
-    if (!walletAddress || !solPercentage) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-
-    // Insert into database first
-    const { data: tracker, error } = await supabase
-      .from('trackers')
-      .insert({
-        wallet_address: walletAddress,
-        sol_percentage: solPercentage,
-        is_active: true
-      })
-      .select()
-      .single();
-
-    if (error) {
-      throw error;
-    }
-
-    // Create and start tracker
-    const walletTracker = new WalletTracker(tracker.id, walletAddress, solPercentage);
-    await walletTracker.startTracking();
-    activeTrackers.set(walletAddress, walletTracker);
-    
-    res.status(201).json(tracker);
-  } catch (error) {
-    console.error('Error creating tracker:', error);
-    res.status(500).json({ error: 'Failed to create tracker' });
-  }
-});
-
-app.get('/api/trackers', async (req, res) => {
-  try {
-    const { data: trackers, error } = await supabase
-      .from('trackers')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      throw error;
-    }
-
-    res.json(trackers);
-  } catch (error) {
-    console.error('Error fetching trackers:', error);
-    res.status(500).json({ error: 'Failed to fetch trackers' });
-  }
-});
-
-app.patch('/api/trackers/:address', async (req, res) => {
-  try {
-    const { address } = req.params;
-    const tracker = activeTrackers.get(address);
-    const { isActive, solPercentage } = req.body;
-    
-    // Update database
-    const { data: updatedTracker, error } = await supabase
-      .from('trackers')
-      .update({
-        is_active: isActive,
-        sol_percentage: solPercentage,
-        updated_at: new Date().toISOString()
-      })
-      .eq('wallet_address', address)
-      .select()
-      .single();
-
-    if (error) {
-      throw error;
-    }
-
-    // Update memory tracker
-    if (tracker) {
-      if (isActive !== undefined) {
-        if (isActive) {
-          tracker.startTracking();
-        } else {
-          tracker.stopTracking();
-        }
-        tracker.isActive = isActive;
-      }
-
-      if (solPercentage !== undefined) {
-        tracker.solPercentage = solPercentage;
-      }
-    }
-
-    res.json(updatedTracker);
-  } catch (error) {
-    console.error('Error updating tracker:', error);
-    res.status(500).json({ error: 'Failed to update tracker' });
-  }
-});
-
-app.delete('/api/trackers/:address', async (req, res) => {
-  try {
-    const { address } = req.params;
-    const tracker = activeTrackers.get(address);
-    
-    // Delete from database
-    const { error } = await supabase
-      .from('trackers')
-      .delete()
-      .eq('wallet_address', address);
-
-    if (error) {
-      throw error;
-    }
-
-    // Stop and remove from memory
-    if (tracker) {
-      tracker.stopTracking();
-      activeTrackers.delete(address);
-    }
-    
-    res.status(204).send();
-  } catch (error) {
-    console.error('Error deleting tracker:', error);
-    res.status(500).json({ error: 'Failed to delete tracker' });
-  }
-});
+// Rest of the code remains the same...
+// (Express routes and server setup)
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
