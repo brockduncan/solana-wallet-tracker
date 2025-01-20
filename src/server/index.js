@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair, Transaction } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { createClient } from "@supabase/supabase-js";
 import fetch from "node-fetch";
@@ -19,35 +19,15 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
-// Initialize Solana connection with commitment and rate limit config
+// Initialize Solana connection with commitment and custom retry settings
 const connection = new Connection("https://api.mainnet-beta.solana.com", {
   commitment: "confirmed",
   confirmTransactionInitialTimeout: 60000,
-  wsEndpoint: "wss://api.mainnet-beta.solana.com/",
+  disableRetryOnRateLimit: false,
+  httpHeaders: {
+    "Content-Type": "application/json",
+  },
 });
-
-// Rate limiting configuration - Much more conservative now
-const RATE_LIMIT_WINDOW = 60000; // 60 seconds (doubled)
-const MAX_REQUESTS_PER_WINDOW = 3; // Reduced from 5
-const requestCounts = new Map();
-
-// Exponential backoff configuration - Longer delays
-const INITIAL_BACKOFF = 5000; // 5 seconds (increased)
-const MAX_BACKOFF = 300000; // 5 minutes (increased)
-const MAX_RETRIES = 5; // Reduced from 8 to fail faster
-
-// Minimum time between operations - Much longer intervals
-const MIN_SCAN_INTERVAL = 300000; // 5 minutes between scans (increased)
-const MIN_QUOTE_INTERVAL = 120000; // 2 minutes between quotes (increased)
-
-// Operation-specific rate limits
-const RATE_LIMITS = {
-  scan: { window: 60000, max: 2 }, // 2 per minute
-  balance: { window: 60000, max: 2 }, // 2 per minute
-  quote: { window: 120000, max: 1 }, // 1 per 2 minutes
-  swap: { window: 300000, max: 1 }, // 1 per 5 minutes
-  transaction: { window: 300000, max: 1 }, // 1 per 5 minutes
-};
 
 // Jupiter API base URL
 const JUPITER_API_BASE = "https://quote-api.jup.ag/v6";
@@ -60,106 +40,95 @@ const mainWalletKeypair = Keypair.fromSecretKey(
   bs58.decode(process.env.MAIN_WALLET_PRIVATE_KEY)
 );
 
-// Enhanced rate limiting function with operation-specific limits
-function checkRateLimit(operation) {
-  const now = Date.now();
-  const limits = RATE_LIMITS[operation] || {
-    window: RATE_LIMIT_WINDOW,
-    max: MAX_REQUESTS_PER_WINDOW,
-  };
-  const windowStart = now - limits.window;
+// Rate limiting configuration
+const RATE_LIMIT = {
+  MIN_DELAY: 2000, // Minimum delay between requests (2 seconds)
+  MAX_DELAY: 32000, // Maximum delay for retries (32 seconds)
+  MAX_RETRIES: 8, // Maximum number of retries
+  SCAN_INTERVAL: 30000, // Minimum interval between full scans (30 seconds)
+  BATCH_SIZE: 3, // Number of concurrent requests
+  BATCH_DELAY: 1000, // Delay between batches (1 second)
+};
 
-  // Clean up old entries
-  for (const [k, data] of requestCounts.entries()) {
-    if (data.timestamp < windowStart) {
-      requestCounts.delete(k);
+// Request queue implementation
+class RequestQueue {
+  constructor() {
+    this.queue = [];
+    this.processing = false;
+  }
+
+  async add(fn) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ fn, resolve, reject });
+      this.process();
+    });
+  }
+
+  async process() {
+    if (this.processing) return;
+    this.processing = true;
+
+    while (this.queue.length > 0) {
+      const batch = this.queue.splice(0, RATE_LIMIT.BATCH_SIZE);
+      const promises = batch.map(async ({ fn, resolve, reject }) => {
+        try {
+          const result = await fn();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      });
+
+      await Promise.all(promises);
+      if (this.queue.length > 0) {
+        await delay(RATE_LIMIT.BATCH_DELAY);
+      }
     }
+
+    this.processing = false;
   }
-
-  const key = `${operation}-${now.toString().slice(0, -3)}`; // Group by second
-  const data = requestCounts.get(key) || { count: 0, timestamp: now };
-
-  if (data.cooldownUntil && now < data.cooldownUntil) {
-    return false;
-  }
-
-  if (data.count >= limits.max) {
-    data.cooldownUntil = now + limits.window;
-    requestCounts.set(key, data);
-    return false;
-  }
-
-  data.count += 1;
-  data.timestamp = now;
-  requestCounts.set(key, data);
-  return true;
 }
 
-// Enhanced retry function with operation-specific handling
-async function retryWithBackoff(operation, operationType, options = {}) {
-  const {
-    maxRetries = MAX_RETRIES,
-    initialBackoff = INITIAL_BACKOFF,
-    maxBackoff = MAX_BACKOFF,
-  } = options;
+const requestQueue = new RequestQueue();
 
-  let retries = 0;
-  let lastError;
+// Helper function for delayed retries with exponential backoff
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  while (retries < maxRetries) {
-    try {
-      if (!checkRateLimit(operationType)) {
-        const waitTime =
-          RATE_LIMITS[operationType]?.window || RATE_LIMIT_WINDOW;
-        console.log(
-          `Rate limit reached for ${operationType}, waiting ${
-            waitTime / 1000
-          }s...`
-        );
-        await new Promise((resolve) => setTimeout(resolve, waitTime));
-        continue;
-      }
-
-      return await operation();
-    } catch (error) {
-      lastError = error;
-
-      const isRateLimit =
-        error.message.includes("429") ||
-        error.message.includes("Too many requests") ||
-        error.message.includes("Rate limit exceeded");
-
-      const isRetriable =
-        isRateLimit ||
-        error.message.includes("timeout") ||
-        error.message.includes("network") ||
-        error.message.includes("connection");
-
-      if (isRetriable) {
-        const backoffTime = Math.min(
-          initialBackoff * Math.pow(2, retries),
-          maxBackoff
-        );
-        console.log(
-          `${operationType} failed (${error.message}). Retrying after ${
-            backoffTime / 1000
-          }s...`
-        );
-        await new Promise((resolve) => setTimeout(resolve, backoffTime));
-        retries++;
-      } else {
-        console.error(`Non-retriable error in ${operationType}:`, error);
-        throw error;
-      }
-    }
-  }
-
-  console.error(
-    `${operationType} failed after ${maxRetries} retries. Last error:`,
-    lastError
+const exponentialBackoff = (attempt) => {
+  const backoff = Math.min(
+    RATE_LIMIT.MIN_DELAY * Math.pow(2, attempt),
+    RATE_LIMIT.MAX_DELAY
   );
-  throw lastError;
-}
+  return backoff + Math.random() * 1000; // Add jitter
+};
+
+// Known unsupported token mints
+const UNSUPPORTED_TOKENS = new Set([
+  "FKWy4E2Jcnaq2QBcMoFg1oDePGjrwW3WRVmtqCmxMQnu",
+  // Add more known unsupported tokens here as they're discovered
+]);
+
+// Token validation helper
+const isValidTokenInfo = (tokenInfo) => {
+  if (!tokenInfo || typeof tokenInfo !== "object") return false;
+
+  // Check for the correct token account structure
+  if (!tokenInfo.tokenAmount || typeof tokenInfo.tokenAmount !== "object")
+    return false;
+
+  const { mint, tokenAmount } = tokenInfo;
+  const { amount, decimals } = tokenAmount;
+
+  return (
+    typeof mint === "string" &&
+    mint.length > 0 &&
+    typeof amount === "string" &&
+    !isNaN(parseInt(amount)) &&
+    typeof decimals === "number" &&
+    decimals >= 0 &&
+    decimals <= 20 // Reasonable max for decimals
+  );
+};
 
 class WalletTracker {
   constructor(id, walletAddress, solPercentage) {
@@ -170,10 +139,11 @@ class WalletTracker {
     this.lastTransaction = null;
     this.subscriptionId = null;
     this.tokenHoldings = new Map();
+    this.retryCount = 0;
     this.lastScanTime = 0;
-    this.lastQuoteTime = 0;
-    this.consecutiveErrors = 0;
-    this.backoffUntil = 0;
+    this.scanInProgress = false;
+    this.lastRequestTime = 0;
+    console.log("Initialized tracker:", walletAddress);
   }
 
   async updateInDb() {
@@ -189,167 +159,222 @@ class WalletTracker {
 
   async startTracking() {
     if (this.subscriptionId) {
-      return;
+      return; // Already tracking
     }
 
-    try {
-      this.subscriptionId = connection.onAccountChange(
-        this.walletAddress,
-        this.handleAccountChange.bind(this),
-        "confirmed"
-      );
+    // Subscribe to account changes
+    this.subscriptionId = connection.onAccountChange(
+      this.walletAddress,
+      this.handleAccountChange.bind(this),
+      "confirmed"
+    );
 
-      await this.scanTokens();
-    } catch (error) {
-      console.error("Error starting tracker:", error);
-      this.isActive = false;
-      await this.updateInDb();
-    }
+    // Initial token scan
+    await this.scanTokens();
   }
 
   async stopTracking() {
     if (this.subscriptionId) {
-      try {
-        await connection.removeAccountChangeListener(this.subscriptionId);
-      } catch (error) {
-        console.error("Error removing account listener:", error);
-      }
+      await connection.removeAccountChangeListener(this.subscriptionId);
       this.subscriptionId = null;
     }
     this.isActive = false;
     await this.updateInDb();
   }
 
-  shouldBackoff() {
-    if (this.backoffUntil > Date.now()) {
-      return true;
-    }
-    return false;
-  }
-
-  increaseBackoff() {
-    this.consecutiveErrors++;
-    const backoffTime = Math.min(
-      INITIAL_BACKOFF * Math.pow(2, this.consecutiveErrors),
-      MAX_BACKOFF
-    );
-    this.backoffUntil = Date.now() + backoffTime;
-  }
-
-  resetBackoff() {
-    this.consecutiveErrors = 0;
-    this.backoffUntil = 0;
-  }
-
   async handleAccountChange(accountInfo, context) {
     try {
-      if (this.shouldBackoff()) {
-        return;
-      }
-
+      // Update last transaction
       this.lastTransaction = context.slot.toString();
       await this.updateInDb();
 
+      // Enforce minimum time between scans
       const now = Date.now();
-      const canScan = now - this.lastScanTime >= MIN_SCAN_INTERVAL;
-      const canQuote = now - this.lastQuoteTime >= MIN_QUOTE_INTERVAL;
-
-      if (canScan) {
-        this.lastScanTime = now;
-        await this.scanTokens();
-
-        if (canQuote) {
-          this.lastQuoteTime = now;
-          await this.checkOpportunities();
-        }
+      if (
+        now - this.lastScanTime < RATE_LIMIT.SCAN_INTERVAL ||
+        this.scanInProgress
+      ) {
+        return;
       }
 
-      this.resetBackoff();
+      // Queue the token scan
+      await requestQueue.add(async () => {
+        await this.scanTokens();
+        await this.checkOpportunities();
+      });
     } catch (error) {
       console.error("Error handling account change:", error);
-      this.increaseBackoff();
     }
   }
 
-  async scanTokens() {
-    try {
-      const tokenAccounts = await retryWithBackoff(async () => {
-        return await connection.getParsedTokenAccountsByOwner(
-          this.walletAddress,
-          { programId: TOKEN_PROGRAM_ID }
-        );
-      }, "scan");
+  async scanTokens(retryAttempt = 0) {
+    if (this.scanInProgress) {
+      console.log("Scan already in progress, skipping...");
+      return;
+    }
 
-      this.tokenHoldings.clear();
-      for (const { account, pubkey } of tokenAccounts.value) {
-        const { mint, amount } = account.data.parsed.info;
-        if (amount > 0) {
-          this.tokenHoldings.set(mint, {
-            amount: amount,
-            address: pubkey.toBase58(),
-          });
+    this.scanInProgress = true;
+
+    try {
+      // Enforce rate limiting with exponential backoff
+      if (retryAttempt > 0) {
+        const backoff = exponentialBackoff(retryAttempt);
+        console.log(
+          `Retrying after ${backoff}ms delay (attempt ${retryAttempt}/${RATE_LIMIT.MAX_RETRIES})...`
+        );
+        await delay(backoff);
+      } else {
+        // Ensure minimum delay between requests even on first attempt
+        const timeSinceLastRequest = Date.now() - this.lastRequestTime;
+        if (timeSinceLastRequest < RATE_LIMIT.MIN_DELAY) {
+          await delay(RATE_LIMIT.MIN_DELAY - timeSinceLastRequest);
         }
       }
+
+      this.lastRequestTime = Date.now();
+
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+        this.walletAddress,
+        { programId: TOKEN_PROGRAM_ID }
+      );
+
+      // Update last scan time
+      this.lastScanTime = Date.now();
+
+      // Update token holdings map
+      this.tokenHoldings.clear();
+
+      for (const { account, pubkey } of tokenAccounts.value) {
+        try {
+          const tokenInfo = account.data.parsed.info;
+
+          // Skip if token info is invalid
+          if (!isValidTokenInfo(tokenInfo)) {
+            console.log("Invalid token info:", tokenInfo);
+            continue;
+          }
+
+          const { mint } = tokenInfo;
+          const { amount, decimals } = tokenInfo.tokenAmount;
+
+          // Skip unsupported tokens
+          if (UNSUPPORTED_TOKENS.has(mint)) {
+            console.log(`Skipping unsupported token: ${mint}`);
+            continue;
+          }
+
+          // Skip tokens with zero balance
+          if (amount === "0") {
+            continue;
+          }
+
+          // Calculate UI amount with proper decimal handling
+          const uiAmount = parseFloat(amount) / Math.pow(10, decimals);
+
+          // Skip if UI amount is invalid
+          if (isNaN(uiAmount)) {
+            console.log(`Invalid UI amount for token ${mint}`);
+            continue;
+          }
+
+          this.tokenHoldings.set(mint, {
+            amount,
+            decimals,
+            uiAmount,
+            address: pubkey.toBase58(),
+          });
+
+          console.log("Token holding details:", {
+            mint,
+            amount,
+            decimals,
+            uiAmount,
+          });
+        } catch (error) {
+          console.error("Error processing token account:", error);
+          continue;
+        }
+      }
+
+      // Reset retry count on successful scan
+      this.retryCount = 0;
     } catch (error) {
+      if (
+        error.message.includes("429") &&
+        retryAttempt < RATE_LIMIT.MAX_RETRIES
+      ) {
+        this.scanInProgress = false;
+        return this.scanTokens(retryAttempt + 1);
+      }
       console.error("Error scanning tokens:", error);
-      this.increaseBackoff();
+    } finally {
+      this.scanInProgress = false;
     }
   }
 
   async checkOpportunities() {
     try {
-      const mainBalance = await retryWithBackoff(async () => {
-        return await connection.getBalance(mainWalletKeypair.publicKey);
-      }, "balance");
-
+      // Get main wallet SOL balance
+      const mainBalance = await connection.getBalance(
+        mainWalletKeypair.publicKey
+      );
       const availableSOL = (mainBalance * this.solPercentage) / 100;
 
-      for (const [mint, holding] of this.tokenHoldings) {
-        try {
-          const response = await retryWithBackoff(async () => {
-            const res = await fetch(`${JUPITER_API_BASE}/quote`, {
-              method: "GET",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                inputMint: mint,
-                outputMint: "So11111111111111111111111111111111111111112",
-                amount: holding.amount,
-                slippageBps: 50,
-                onlyDirectRoutes: false,
-              }),
+      // Process token holdings in batches
+      const tokenEntries = Array.from(this.tokenHoldings.entries());
+      for (let i = 0; i < tokenEntries.length; i += RATE_LIMIT.BATCH_SIZE) {
+        const batch = tokenEntries.slice(i, i + RATE_LIMIT.BATCH_SIZE);
+        const promises = batch.map(async ([mint, holding]) => {
+          try {
+            // Queue the quote request
+            return await requestQueue.add(async () => {
+              const response = await fetch(`${JUPITER_API_BASE}/quote`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  inputMint: mint,
+                  outputMint: "So11111111111111111111111111111111111111112", // SOL
+                  amount: holding.amount,
+                  slippageBps: 50,
+                  onlyDirectRoutes: false,
+                }),
+              });
+
+              if (!response.ok) {
+                throw new Error(`Jupiter API error: ${response.statusText}`);
+              }
+
+              const quote = await response.json();
+
+              // If profit opportunity exists (e.g., > 1% after fees)
+              if (quote.outAmount > availableSOL * 1.01) {
+                await this.executeSwap(quote);
+              }
             });
-
-            if (!res.ok) {
-              throw new Error(`Jupiter API error: ${res.statusText}`);
+          } catch (error) {
+            if (!error.message.includes("Bad Request")) {
+              console.error(`Error getting quote for mint ${mint}:`, error);
             }
-
-            return res;
-          }, "quote");
-
-          const quote = await response.json();
-
-          if (quote.outAmount > availableSOL * 1.01) {
-            await this.executeSwap(quote);
           }
-        } catch (error) {
-          if (!error.message.includes("Rate limit")) {
-            console.error(`Error getting quote for mint ${mint}:`, error);
-          }
-          continue;
+        });
+
+        await Promise.all(promises);
+        if (i + RATE_LIMIT.BATCH_SIZE < tokenEntries.length) {
+          await delay(RATE_LIMIT.BATCH_DELAY);
         }
       }
     } catch (error) {
       console.error("Error checking opportunities:", error);
-      this.increaseBackoff();
     }
   }
 
   async executeSwap(quote) {
     try {
-      const swapResponse = await retryWithBackoff(async () => {
-        const res = await fetch(`${JUPITER_API_BASE}/swap`, {
+      // Queue the swap execution
+      await requestQueue.add(async () => {
+        const swapResponse = await fetch(`${JUPITER_API_BASE}/swap`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -357,37 +382,218 @@ class WalletTracker {
           body: JSON.stringify({
             quoteResponse: quote,
             userPublicKey: mainWalletKeypair.publicKey.toString(),
+            wrapUnwrapSOL: true,
           }),
         });
 
-        if (!res.ok) {
-          throw new Error(`Jupiter API error: ${res.statusText}`);
+        if (!swapResponse.ok) {
+          throw new Error(`Jupiter API error: ${swapResponse.statusText}`);
         }
 
-        return res;
-      }, "swap");
+        const { swapTransaction } = await swapResponse.json();
 
-      const { swapTransaction } = await swapResponse.json();
-      const transaction = swapTransaction;
-      transaction.sign([mainWalletKeypair]);
+        // Add delay before transaction execution
+        await delay(500);
 
-      const signature = await retryWithBackoff(async () => {
-        const sig = await connection.sendTransaction(transaction);
-        await connection.confirmTransaction(sig);
-        return sig;
-      }, "transaction");
+        // Deserialize the transaction
+        const transaction = Transaction.from(
+          Buffer.from(swapTransaction, "base64")
+        );
 
-      this.lastTransaction = signature;
-      await this.updateInDb();
+        // Sign the transaction
+        transaction.partialSign(mainWalletKeypair);
+
+        // Send and confirm the transaction
+        const signature = await connection.sendRawTransaction(
+          transaction.serialize()
+        );
+        await connection.confirmTransaction(signature);
+
+        // Update last transaction
+        this.lastTransaction = signature;
+        await this.updateInDb();
+
+        console.log(`Swap executed successfully: ${signature}`);
+      });
     } catch (error) {
       console.error("Error executing swap:", error);
-      this.increaseBackoff();
     }
   }
 }
 
-// Rest of the code remains the same...
-// (Express routes and server setup)
+// Load existing trackers from database on startup
+async function loadTrackers() {
+  const { data: trackers, error } = await supabase
+    .from("trackers")
+    .select("*")
+    .eq("is_active", true);
+
+  if (error) {
+    console.error("Error loading trackers:", error);
+    return;
+  }
+
+  for (const tracker of trackers) {
+    const walletTracker = new WalletTracker(
+      tracker.id,
+      tracker.wallet_address,
+      tracker.sol_percentage
+    );
+    await walletTracker.startTracking();
+    activeTrackers.set(tracker.wallet_address, walletTracker);
+  }
+}
+
+// Load trackers on startup
+loadTrackers();
+
+// Health check endpoint for Render
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    activeTrackers: activeTrackers.size,
+  });
+});
+
+// Keep-alive endpoint
+app.get("/keep-alive", (req, res) => {
+  res.status(200).json({
+    status: "alive",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// API Routes
+app.post("/api/trackers", async (req, res) => {
+  try {
+    const { walletAddress, solPercentage } = req.body;
+
+    if (!walletAddress || !solPercentage) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // Insert into database first
+    const { data: tracker, error } = await supabase
+      .from("trackers")
+      .insert({
+        wallet_address: walletAddress,
+        sol_percentage: solPercentage,
+        is_active: true,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    // Create and start tracker
+    const walletTracker = new WalletTracker(
+      tracker.id,
+      walletAddress,
+      solPercentage
+    );
+    await walletTracker.startTracking();
+    activeTrackers.set(walletAddress, walletTracker);
+
+    res.status(201).json(tracker);
+  } catch (error) {
+    console.error("Error creating tracker:", error);
+    res.status(500).json({ error: "Failed to create tracker" });
+  }
+});
+
+app.get("/api/trackers", async (req, res) => {
+  try {
+    const { data: trackers, error } = await supabase
+      .from("trackers")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      throw error;
+    }
+
+    res.json(trackers);
+  } catch (error) {
+    console.error("Error fetching trackers:", error);
+    res.status(500).json({ error: "Failed to fetch trackers" });
+  }
+});
+
+app.patch("/api/trackers/:address", async (req, res) => {
+  try {
+    const { address } = req.params;
+    const tracker = activeTrackers.get(address);
+    const { isActive, solPercentage } = req.body;
+
+    // Update database
+    const { data: updatedTracker, error } = await supabase
+      .from("trackers")
+      .update({
+        is_active: isActive,
+        sol_percentage: solPercentage,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("wallet_address", address)
+      .select()
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    // Update memory tracker
+    if (tracker) {
+      if (isActive !== undefined) {
+        if (isActive) {
+          tracker.startTracking();
+        } else {
+          tracker.stopTracking();
+        }
+        tracker.isActive = isActive;
+      }
+
+      if (solPercentage !== undefined) {
+        tracker.solPercentage = solPercentage;
+      }
+    }
+
+    res.json(updatedTracker);
+  } catch (error) {
+    console.error("Error updating tracker:", error);
+    res.status(500).json({ error: "Failed to update tracker" });
+  }
+});
+
+app.delete("/api/trackers/:address", async (req, res) => {
+  try {
+    const { address } = req.params;
+    const tracker = activeTrackers.get(address);
+
+    // Delete from database
+    const { error } = await supabase
+      .from("trackers")
+      .delete()
+      .eq("wallet_address", address);
+
+    if (error) {
+      throw error;
+    }
+
+    // Stop and remove from memory
+    if (tracker) {
+      tracker.stopTracking();
+      activeTrackers.delete(address);
+    }
+
+    res.status(204).send();
+  } catch (error) {
+    console.error("Error deleting tracker:", error);
+    res.status(500).json({ error: "Failed to delete tracker" });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
