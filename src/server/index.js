@@ -42,24 +42,64 @@ const mainWalletKeypair = Keypair.fromSecretKey(
 
 // Rate limiting configuration
 const RATE_LIMIT = {
-  MIN_DELAY: 2000, // Minimum delay between requests (2 seconds)
-  MAX_DELAY: 32000, // Maximum delay for retries (32 seconds)
-  MAX_RETRIES: 8, // Maximum number of retries
-  SCAN_INTERVAL: 30000, // Minimum interval between full scans (30 seconds)
-  BATCH_SIZE: 3, // Number of concurrent requests
-  BATCH_DELAY: 1000, // Delay between batches (1 second)
+  MIN_DELAY: 10000, // Increased minimum delay between requests (10 seconds)
+  MAX_DELAY: 60000, // Maximum delay for retries (60 seconds)
+  MAX_RETRIES: 5, // Reduced max retries to avoid excessive waiting
+  SCAN_INTERVAL: 300000, // Increased minimum interval between full scans (5 minutes)
+  BATCH_SIZE: 1, // Reduced to 1 to avoid rate limits
+  BATCH_DELAY: 5000, // Increased delay between batches (5 seconds)
+  TOKEN_PROCESS_DELAY: 2000, // Increased delay between processing tokens (2 seconds)
 };
 
-// Request queue implementation
+// Enhanced logging utility
+const log = {
+  info: (message, data = {}) => {
+    console.log(
+      `[${new Date().toISOString()}] INFO: ${message}`,
+      JSON.stringify(data, null, 2)
+    );
+  },
+  error: (message, error = {}) => {
+    console.error(`[${new Date().toISOString()}] ERROR: ${message}`, error);
+  },
+  websocket: (message, data = {}) => {
+    console.log(
+      `[${new Date().toISOString()}] WEBSOCKET: ${message}`,
+      JSON.stringify(data, null, 2)
+    );
+  },
+  tracker: (address, message, data = {}) => {
+    console.log(
+      `[${new Date().toISOString()}] TRACKER [${address}]: ${message}`,
+      JSON.stringify(data, null, 2)
+    );
+  },
+};
+
+// Request queue implementation with rate limiting
 class RequestQueue {
   constructor() {
     this.queue = [];
     this.processing = false;
+    this.lastProcessTime = 0;
+    this.retryCount = new Map();
   }
 
-  async add(fn) {
+  async add(fn, priority = false, maxRetries = RATE_LIMIT.MAX_RETRIES) {
     return new Promise((resolve, reject) => {
-      this.queue.push({ fn, resolve, reject });
+      const queueItem = {
+        fn,
+        resolve,
+        reject,
+        priority,
+        maxRetries,
+        attempts: 0,
+      };
+      if (priority) {
+        this.queue.unshift(queueItem);
+      } else {
+        this.queue.push(queueItem);
+      }
       this.process();
     });
   }
@@ -69,17 +109,21 @@ class RequestQueue {
     this.processing = true;
 
     while (this.queue.length > 0) {
-      const batch = this.queue.splice(0, RATE_LIMIT.BATCH_SIZE);
-      const promises = batch.map(async ({ fn, resolve, reject }) => {
-        try {
-          const result = await fn();
-          resolve(result);
-        } catch (error) {
-          reject(error);
-        }
-      });
+      const now = Date.now();
+      const timeSinceLastProcess = now - this.lastProcessTime;
+      if (timeSinceLastProcess < RATE_LIMIT.MIN_DELAY) {
+        await delay(RATE_LIMIT.MIN_DELAY - timeSinceLastProcess);
+      }
 
-      await Promise.all(promises);
+      const item = this.queue.shift();
+      try {
+        const result = await this.executeWithRetry(item);
+        item.resolve(result);
+      } catch (error) {
+        item.reject(error);
+      }
+
+      this.lastProcessTime = Date.now();
       if (this.queue.length > 0) {
         await delay(RATE_LIMIT.BATCH_DELAY);
       }
@@ -87,47 +131,38 @@ class RequestQueue {
 
     this.processing = false;
   }
+
+  async executeWithRetry({ fn, attempts, maxRetries }) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (error.message?.includes("429") && attempts < maxRetries) {
+        const backoff = exponentialBackoff(attempts);
+        log.info(
+          `Rate limited, retrying after ${backoff}ms delay (attempt ${
+            attempts + 1
+          }/${maxRetries})`
+        );
+        await delay(backoff);
+        return this.executeWithRetry({
+          fn,
+          attempts: attempts + 1,
+          maxRetries,
+        });
+      }
+      throw error;
+    }
+  }
 }
 
 const requestQueue = new RequestQueue();
-
-// Helper function for delayed retries with exponential backoff
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const exponentialBackoff = (attempt) => {
   const backoff = Math.min(
     RATE_LIMIT.MIN_DELAY * Math.pow(2, attempt),
     RATE_LIMIT.MAX_DELAY
   );
-  return backoff + Math.random() * 1000; // Add jitter
-};
-
-// Known unsupported token mints
-const UNSUPPORTED_TOKENS = new Set([
-  "FKWy4E2Jcnaq2QBcMoFg1oDePGjrwW3WRVmtqCmxMQnu",
-  // Add more known unsupported tokens here as they're discovered
-]);
-
-// Token validation helper
-const isValidTokenInfo = (tokenInfo) => {
-  if (!tokenInfo || typeof tokenInfo !== "object") return false;
-
-  // Check for the correct token account structure
-  if (!tokenInfo.tokenAmount || typeof tokenInfo.tokenAmount !== "object")
-    return false;
-
-  const { mint, tokenAmount } = tokenInfo;
-  const { amount, decimals } = tokenAmount;
-
-  return (
-    typeof mint === "string" &&
-    mint.length > 0 &&
-    typeof amount === "string" &&
-    !isNaN(parseInt(amount)) &&
-    typeof decimals === "number" &&
-    decimals >= 0 &&
-    decimals <= 20 // Reasonable max for decimals
-  );
+  return backoff + Math.random() * 2000;
 };
 
 class WalletTracker {
@@ -139,44 +174,93 @@ class WalletTracker {
     this.lastTransaction = null;
     this.subscriptionId = null;
     this.tokenHoldings = new Map();
-    this.retryCount = 0;
     this.lastScanTime = 0;
-    this.scanInProgress = false;
-    this.lastRequestTime = 0;
-    console.log("Initialized tracker:", walletAddress);
+    this.isScanning = false;
+
+    log.tracker(walletAddress, "Tracker initialized", {
+      id,
+      solPercentage,
+      isActive: this.isActive,
+    });
   }
 
   async updateInDb() {
-    await supabase
-      .from("trackers")
-      .update({
-        is_active: this.isActive,
-        last_transaction: this.lastTransaction,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", this.id);
+    try {
+      await supabase
+        .from("trackers")
+        .update({
+          is_active: this.isActive,
+          last_transaction: this.lastTransaction,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", this.id);
+
+      log.tracker(this.walletAddress.toString(), "Database updated", {
+        isActive: this.isActive,
+        lastTransaction: this.lastTransaction,
+      });
+    } catch (error) {
+      log.error("Failed to update tracker in database", error);
+    }
   }
 
   async startTracking() {
     if (this.subscriptionId) {
-      return; // Already tracking
+      log.tracker(this.walletAddress.toString(), "Already tracking");
+      return;
     }
 
-    // Subscribe to account changes
-    this.subscriptionId = connection.onAccountChange(
-      this.walletAddress,
-      this.handleAccountChange.bind(this),
-      "confirmed"
-    );
+    try {
+      // Subscribe to account changes
+      this.subscriptionId = connection.onAccountChange(
+        this.walletAddress,
+        async (accountInfo, context) => {
+          log.websocket("Account change detected", {
+            wallet: this.walletAddress.toString(),
+            slot: context.slot,
+            accountInfo: {
+              lamports: accountInfo.lamports,
+              owner: accountInfo.owner.toString(),
+              executable: accountInfo.executable,
+              rentEpoch: accountInfo.rentEpoch,
+            },
+          });
+          await this.handleAccountChange(accountInfo, context);
+        },
+        "confirmed"
+      );
 
-    // Initial token scan
-    await this.scanTokens();
+      log.tracker(
+        this.walletAddress.toString(),
+        "Websocket subscription started",
+        {
+          subscriptionId: this.subscriptionId,
+        }
+      );
+
+      // Initial token scan
+      await this.scanTokens();
+    } catch (error) {
+      log.error("Failed to start tracking", error);
+      throw error;
+    }
   }
 
   async stopTracking() {
     if (this.subscriptionId) {
-      await connection.removeAccountChangeListener(this.subscriptionId);
-      this.subscriptionId = null;
+      try {
+        await connection.removeAccountChangeListener(this.subscriptionId);
+        log.tracker(
+          this.walletAddress.toString(),
+          "Websocket subscription stopped",
+          {
+            subscriptionId: this.subscriptionId,
+          }
+        );
+        this.subscriptionId = null;
+      } catch (error) {
+        log.error("Failed to remove account change listener", error);
+      }
     }
     this.isActive = false;
     await this.updateInDb();
@@ -184,263 +268,115 @@ class WalletTracker {
 
   async handleAccountChange(accountInfo, context) {
     try {
-      // Update last transaction
+      log.tracker(this.walletAddress.toString(), "Processing account change", {
+        slot: context.slot,
+        lamports: accountInfo.lamports,
+      });
+
       this.lastTransaction = context.slot.toString();
       await this.updateInDb();
 
-      // Enforce minimum time between scans
+      // Only scan tokens if enough time has passed since last scan and not currently scanning
       const now = Date.now();
       if (
-        now - this.lastScanTime < RATE_LIMIT.SCAN_INTERVAL ||
-        this.scanInProgress
+        !this.isScanning &&
+        now - this.lastScanTime >= RATE_LIMIT.SCAN_INTERVAL
       ) {
-        return;
+        await this.scanTokens();
       }
 
-      // Queue the token scan
-      await requestQueue.add(async () => {
-        await this.scanTokens();
-        await this.checkOpportunities();
-      });
+      await this.checkOpportunities();
     } catch (error) {
-      console.error("Error handling account change:", error);
+      log.error("Error handling account change", error);
     }
   }
 
-  async scanTokens(retryAttempt = 0) {
-    if (this.scanInProgress) {
-      console.log("Scan already in progress, skipping...");
+  async scanTokens() {
+    if (this.isScanning) {
+      log.tracker(
+        this.walletAddress.toString(),
+        "Token scan already in progress, skipping"
+      );
       return;
     }
 
-    this.scanInProgress = true;
-
+    this.isScanning = true;
     try {
-      // Enforce rate limiting with exponential backoff
-      if (retryAttempt > 0) {
-        const backoff = exponentialBackoff(retryAttempt);
-        console.log(
-          `Retrying after ${backoff}ms delay (attempt ${retryAttempt}/${RATE_LIMIT.MAX_RETRIES})...`
+      log.tracker(this.walletAddress.toString(), "Starting token scan");
+
+      const scanTokens = async () => {
+        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+          this.walletAddress,
+          { programId: TOKEN_PROGRAM_ID }
         );
-        await delay(backoff);
-      } else {
-        // Ensure minimum delay between requests even on first attempt
-        const timeSinceLastRequest = Date.now() - this.lastRequestTime;
-        if (timeSinceLastRequest < RATE_LIMIT.MIN_DELAY) {
-          await delay(RATE_LIMIT.MIN_DELAY - timeSinceLastRequest);
-        }
-      }
+        return tokenAccounts;
+      };
 
-      this.lastRequestTime = Date.now();
-
-      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
-        this.walletAddress,
-        { programId: TOKEN_PROGRAM_ID }
+      const tokenAccounts = await requestQueue.add(
+        () => scanTokens(),
+        false, // not priority
+        RATE_LIMIT.MAX_RETRIES
       );
 
-      // Update last scan time
-      this.lastScanTime = Date.now();
-
-      // Update token holdings map
       this.tokenHoldings.clear();
-
       for (const { account, pubkey } of tokenAccounts.value) {
-        try {
-          const tokenInfo = account.data.parsed.info;
-
-          // Skip if token info is invalid
-          if (!isValidTokenInfo(tokenInfo)) {
-            console.log("Invalid token info:", tokenInfo);
-            continue;
-          }
-
-          const { mint } = tokenInfo;
-          const { amount, decimals } = tokenInfo.tokenAmount;
-
-          // Skip unsupported tokens
-          if (UNSUPPORTED_TOKENS.has(mint)) {
-            console.log(`Skipping unsupported token: ${mint}`);
-            continue;
-          }
-
-          // Skip tokens with zero balance
-          if (amount === "0") {
-            continue;
-          }
-
-          // Calculate UI amount with proper decimal handling
-          const uiAmount = parseFloat(amount) / Math.pow(10, decimals);
-
-          // Skip if UI amount is invalid
-          if (isNaN(uiAmount)) {
-            console.log(`Invalid UI amount for token ${mint}`);
-            continue;
-          }
-
-          this.tokenHoldings.set(mint, {
-            amount,
-            decimals,
-            uiAmount,
-            address: pubkey.toBase58(),
-          });
-
-          console.log("Token holding details:", {
-            mint,
-            amount,
-            decimals,
-            uiAmount,
-          });
-        } catch (error) {
-          console.error("Error processing token account:", error);
-          continue;
-        }
-      }
-
-      // Reset retry count on successful scan
-      this.retryCount = 0;
-    } catch (error) {
-      if (
-        error.message.includes("429") &&
-        retryAttempt < RATE_LIMIT.MAX_RETRIES
-      ) {
-        this.scanInProgress = false;
-        return this.scanTokens(retryAttempt + 1);
-      }
-      console.error("Error scanning tokens:", error);
-    } finally {
-      this.scanInProgress = false;
-    }
-  }
-
-  async checkOpportunities() {
-    try {
-      // Get main wallet SOL balance
-      const mainBalance = await connection.getBalance(
-        mainWalletKeypair.publicKey
-      );
-      const availableSOL = (mainBalance * this.solPercentage) / 100;
-
-      // Process token holdings in batches
-      const tokenEntries = Array.from(this.tokenHoldings.entries());
-      for (let i = 0; i < tokenEntries.length; i += RATE_LIMIT.BATCH_SIZE) {
-        const batch = tokenEntries.slice(i, i + RATE_LIMIT.BATCH_SIZE);
-        const promises = batch.map(async ([mint, holding]) => {
-          try {
-            // Queue the quote request
-            return await requestQueue.add(async () => {
-              const response = await fetch(`${JUPITER_API_BASE}/quote`, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  inputMint: mint,
-                  outputMint: "So11111111111111111111111111111111111111112", // SOL
-                  amount: holding.amount,
-                  slippageBps: 50,
-                  onlyDirectRoutes: false,
-                }),
-              });
-
-              if (!response.ok) {
-                throw new Error(`Jupiter API error: ${response.statusText}`);
-              }
-
-              const quote = await response.json();
-
-              // If profit opportunity exists (e.g., > 1% after fees)
-              if (quote.outAmount > availableSOL * 1.01) {
-                await this.executeSwap(quote);
-              }
-            });
-          } catch (error) {
-            if (!error.message.includes("Bad Request")) {
-              console.error(`Error getting quote for mint ${mint}:`, error);
-            }
-          }
+        const { mint, amount, decimals } = account.data.parsed.info;
+        this.tokenHoldings.set(mint, {
+          amount: amount,
+          decimals: decimals,
+          address: pubkey.toBase58(),
         });
 
-        await Promise.all(promises);
-        if (i + RATE_LIMIT.BATCH_SIZE < tokenEntries.length) {
-          await delay(RATE_LIMIT.BATCH_DELAY);
-        }
-      }
-    } catch (error) {
-      console.error("Error checking opportunities:", error);
-    }
-  }
-
-  async executeSwap(quote) {
-    try {
-      // Queue the swap execution
-      await requestQueue.add(async () => {
-        const swapResponse = await fetch(`${JUPITER_API_BASE}/swap`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            quoteResponse: quote,
-            userPublicKey: mainWalletKeypair.publicKey.toString(),
-            wrapUnwrapSOL: true,
-          }),
+        log.tracker(this.walletAddress.toString(), "Token found", {
+          mint,
+          amount,
+          decimals,
+          address: pubkey.toBase58(),
         });
+      }
 
-        if (!swapResponse.ok) {
-          throw new Error(`Jupiter API error: ${swapResponse.statusText}`);
-        }
-
-        const { swapTransaction } = await swapResponse.json();
-
-        // Add delay before transaction execution
-        await delay(500);
-
-        // Deserialize the transaction
-        const transaction = Transaction.from(
-          Buffer.from(swapTransaction, "base64")
-        );
-
-        // Sign the transaction
-        transaction.partialSign(mainWalletKeypair);
-
-        // Send and confirm the transaction
-        const signature = await connection.sendRawTransaction(
-          transaction.serialize()
-        );
-        await connection.confirmTransaction(signature);
-
-        // Update last transaction
-        this.lastTransaction = signature;
-        await this.updateInDb();
-
-        console.log(`Swap executed successfully: ${signature}`);
+      this.lastScanTime = Date.now();
+      log.tracker(this.walletAddress.toString(), "Token scan completed", {
+        tokenCount: this.tokenHoldings.size,
       });
     } catch (error) {
-      console.error("Error executing swap:", error);
+      log.error("Error scanning tokens", error);
+    } finally {
+      this.isScanning = false;
     }
   }
 }
 
 // Load existing trackers from database on startup
 async function loadTrackers() {
-  const { data: trackers, error } = await supabase
-    .from("trackers")
-    .select("*")
-    .eq("is_active", true);
+  try {
+    const { data: trackers, error } = await supabase
+      .from("trackers")
+      .select("*")
+      .eq("is_active", true);
 
-  if (error) {
-    console.error("Error loading trackers:", error);
-    return;
-  }
+    if (error) {
+      log.error("Error loading trackers from database", error);
+      return;
+    }
 
-  for (const tracker of trackers) {
-    const walletTracker = new WalletTracker(
-      tracker.id,
-      tracker.wallet_address,
-      tracker.sol_percentage
-    );
-    await walletTracker.startTracking();
-    activeTrackers.set(tracker.wallet_address, walletTracker);
+    log.info("Loading trackers from database", { count: trackers.length });
+
+    for (const tracker of trackers) {
+      const walletTracker = new WalletTracker(
+        tracker.id,
+        tracker.wallet_address,
+        tracker.sol_percentage
+      );
+      await walletTracker.startTracking();
+      activeTrackers.set(tracker.wallet_address, walletTracker);
+    }
+
+    log.info("Trackers loaded and started", {
+      activeTrackerCount: activeTrackers.size,
+    });
+  } catch (error) {
+    log.error("Failed to load trackers", error);
   }
 }
 
