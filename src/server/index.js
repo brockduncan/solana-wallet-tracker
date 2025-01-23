@@ -1,11 +1,25 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { Connection, PublicKey, Keypair, Transaction } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import {
+  Connection,
+  PublicKey,
+  Keypair,
+  Transaction,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+  TransactionInstruction,
+} from "@solana/web3.js";
+import {
+  TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountInstruction,
+  getAssociatedTokenAddress,
+  createCloseAccountInstruction,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
 import { createClient } from "@supabase/supabase-js";
-import fetch from "node-fetch";
 import bs58 from "bs58";
+import fetch from "node-fetch";
 
 dotenv.config();
 
@@ -19,151 +33,101 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
-// Initialize Solana connection with commitment and custom retry settings
-const connection = new Connection("https://api.mainnet-beta.solana.com", {
-  commitment: "confirmed",
-  confirmTransactionInitialTimeout: 60000,
-  disableRetryOnRateLimit: false,
-  httpHeaders: {
-    "Content-Type": "application/json",
-  },
-});
-
-// Jupiter API base URL
-const JUPITER_API_BASE = "https://quote-api.jup.ag/v6";
-
-// Store active trackers in memory (but persist to Supabase)
-const activeTrackers = new Map();
-
-// Load the main wallet from environment variables
-const mainWalletKeypair = Keypair.fromSecretKey(
-  bs58.decode(process.env.MAIN_WALLET_PRIVATE_KEY)
+// Initialize Solana connection
+const connection = new Connection(
+  "https://api.mainnet-beta.solana.com",
+  "confirmed"
 );
 
-// Rate limiting configuration
+// Initialize main wallet
+const mainWalletPrivateKey = bs58.decode(process.env.MAIN_WALLET_PRIVATE_KEY);
+const mainWallet = Keypair.fromSecretKey(mainWalletPrivateKey);
+
+// DEX Program IDs
+const DEX_PROGRAMS = {
+  ORCA: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+  RAYDIUM: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+};
+
+// Rate limiting settings
 const RATE_LIMIT = {
-  MIN_DELAY: 10000, // Increased minimum delay between requests (10 seconds)
-  MAX_DELAY: 60000, // Maximum delay for retries (60 seconds)
-  MAX_RETRIES: 5, // Reduced max retries to avoid excessive waiting
-  SCAN_INTERVAL: 300000, // Increased minimum interval between full scans (5 minutes)
-  BATCH_SIZE: 1, // Reduced to 1 to avoid rate limits
-  BATCH_DELAY: 5000, // Increased delay between batches (5 seconds)
-  TOKEN_PROCESS_DELAY: 2000, // Increased delay between processing tokens (2 seconds)
+  BATCH_SIZE: 25,
+  BATCH_DELAY_MS: 1000,
+  TOKENS_PER_SECOND: 4,
+  BUCKET_SIZE: 10,
+  MAX_RETRIES: 3,
+  ACCOUNT_CHANGE_COOLDOWN_MS: 10000, // 10 seconds between account changes
 };
 
-// Enhanced logging utility
-const log = {
-  info: (message, data = {}) => {
-    console.log(
-      `[${new Date().toISOString()}] INFO: ${message}`,
-      JSON.stringify(data, null, 2)
-    );
-  },
-  error: (message, error = {}) => {
-    console.error(`[${new Date().toISOString()}] ERROR: ${message}`, error);
-  },
-  websocket: (message, data = {}) => {
-    console.log(
-      `[${new Date().toISOString()}] WEBSOCKET: ${message}`,
-      JSON.stringify(data, null, 2)
-    );
-  },
-  tracker: (address, message, data = {}) => {
-    console.log(
-      `[${new Date().toISOString()}] TRACKER [${address}]: ${message}`,
-      JSON.stringify(data, null, 2)
-    );
-  },
-};
-
-// Request queue implementation with rate limiting
-class RequestQueue {
-  constructor() {
-    this.queue = [];
+// Token bucket rate limiter
+class TokenBucket {
+  constructor(tokensPerSecond, bucketSize) {
+    this.tokensPerSecond = tokensPerSecond;
+    this.bucketSize = bucketSize;
+    this.tokens = bucketSize;
+    this.lastRefill = Date.now();
+    this.requestQueue = [];
     this.processing = false;
-    this.lastProcessTime = 0;
-    this.retryCount = new Map();
   }
 
-  async add(fn, priority = false, maxRetries = RATE_LIMIT.MAX_RETRIES) {
+  async refill() {
+    const now = Date.now();
+    const timePassed = (now - this.lastRefill) / 1000;
+    this.tokens = Math.min(
+      this.bucketSize,
+      this.tokens + timePassed * this.tokensPerSecond
+    );
+    this.lastRefill = now;
+  }
+
+  async acquireToken() {
+    await this.refill();
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return true;
+    }
+    return false;
+  }
+
+  async enqueueRequest(operation) {
     return new Promise((resolve, reject) => {
-      const queueItem = {
-        fn,
-        resolve,
-        reject,
-        priority,
-        maxRetries,
-        attempts: 0,
-      };
-      if (priority) {
-        this.queue.unshift(queueItem);
-      } else {
-        this.queue.push(queueItem);
-      }
-      this.process();
+      this.requestQueue.push({ operation, resolve, reject });
+      this.processQueue();
     });
   }
 
-  async process() {
-    if (this.processing) return;
+  async processQueue() {
+    if (this.processing || this.requestQueue.length === 0) return;
     this.processing = true;
 
-    while (this.queue.length > 0) {
-      const now = Date.now();
-      const timeSinceLastProcess = now - this.lastProcessTime;
-      if (timeSinceLastProcess < RATE_LIMIT.MIN_DELAY) {
-        await delay(RATE_LIMIT.MIN_DELAY - timeSinceLastProcess);
-      }
-
-      const item = this.queue.shift();
-      try {
-        const result = await this.executeWithRetry(item);
-        item.resolve(result);
-      } catch (error) {
-        item.reject(error);
-      }
-
-      this.lastProcessTime = Date.now();
-      if (this.queue.length > 0) {
-        await delay(RATE_LIMIT.BATCH_DELAY);
+    while (this.requestQueue.length > 0) {
+      if (await this.acquireToken()) {
+        const { operation, resolve, reject } = this.requestQueue.shift();
+        try {
+          const result = await operation();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      } else {
+        await delay(1000 / this.tokensPerSecond);
       }
     }
 
     this.processing = false;
   }
-
-  async executeWithRetry({ fn, attempts, maxRetries }) {
-    try {
-      return await fn();
-    } catch (error) {
-      if (error.message?.includes("429") && attempts < maxRetries) {
-        const backoff = exponentialBackoff(attempts);
-        log.info(
-          `Rate limited, retrying after ${backoff}ms delay (attempt ${
-            attempts + 1
-          }/${maxRetries})`
-        );
-        await delay(backoff);
-        return this.executeWithRetry({
-          fn,
-          attempts: attempts + 1,
-          maxRetries,
-        });
-      }
-      throw error;
-    }
-  }
 }
 
-const requestQueue = new RequestQueue();
+const rateLimiter = new TokenBucket(
+  RATE_LIMIT.TOKENS_PER_SECOND,
+  RATE_LIMIT.BUCKET_SIZE
+);
+
+// Utility function for delay
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const exponentialBackoff = (attempt) => {
-  const backoff = Math.min(
-    RATE_LIMIT.MIN_DELAY * Math.pow(2, attempt),
-    RATE_LIMIT.MAX_DELAY
-  );
-  return backoff + Math.random() * 2000;
-};
+
+// Active trackers map
+const activeTrackers = new Map();
 
 class WalletTracker {
   constructor(id, walletAddress, solPercentage) {
@@ -172,366 +136,775 @@ class WalletTracker {
     this.solPercentage = solPercentage;
     this.isActive = true;
     this.lastTransaction = null;
-    this.subscriptionId = null;
     this.tokenHoldings = new Map();
-    this.lastScanTime = 0;
+    this.accountSubscription = null;
     this.isScanning = false;
-
-    log.tracker(walletAddress, "Tracker initialized", {
-      id,
-      solPercentage,
-      isActive: this.isActive,
-    });
+    this.lastAccountChangeTime = 0;
   }
 
-  async updateInDb() {
+  async initialize() {
     try {
-      await supabase
-        .from("trackers")
-        .update({
-          is_active: this.isActive,
-          last_transaction: this.lastTransaction,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", this.id);
-
-      log.tracker(this.walletAddress.toString(), "Database updated", {
-        isActive: this.isActive,
-        lastTransaction: this.lastTransaction,
-      });
-    } catch (error) {
-      log.error("Failed to update tracker in database", error);
-    }
-  }
-
-  async startTracking() {
-    if (this.subscriptionId) {
-      log.tracker(this.walletAddress.toString(), "Already tracking");
-      return;
-    }
-
-    try {
-      // Subscribe to account changes
-      this.subscriptionId = connection.onAccountChange(
-        this.walletAddress,
-        async (accountInfo, context) => {
-          log.websocket("Account change detected", {
-            wallet: this.walletAddress.toString(),
-            slot: context.slot,
-            accountInfo: {
-              lamports: accountInfo.lamports,
-              owner: accountInfo.owner.toString(),
-              executable: accountInfo.executable,
-              rentEpoch: accountInfo.rentEpoch,
-            },
-          });
-          await this.handleAccountChange(accountInfo, context);
-        },
-        "confirmed"
+      console.log(
+        `Initializing tracker for wallet: ${this.walletAddress.toString()}`
       );
 
-      log.tracker(
-        this.walletAddress.toString(),
-        "Websocket subscription started",
-        {
-          subscriptionId: this.subscriptionId,
-        }
+      // Subscribe to account changes
+      this.accountSubscription = connection.onAccountChange(
+        this.walletAddress,
+        this.handleAccountChange.bind(this),
+        "confirmed"
       );
 
       // Initial token scan
       await this.scanTokens();
+
+      console.log(
+        `Tracker initialized for wallet: ${this.walletAddress.toString()}`
+      );
     } catch (error) {
-      log.error("Failed to start tracking", error);
+      console.error(
+        `Error initializing tracker for ${this.walletAddress.toString()}:`,
+        error
+      );
       throw error;
-    }
-  }
-
-  async stopTracking() {
-    if (this.subscriptionId) {
-      try {
-        await connection.removeAccountChangeListener(this.subscriptionId);
-        log.tracker(
-          this.walletAddress.toString(),
-          "Websocket subscription stopped",
-          {
-            subscriptionId: this.subscriptionId,
-          }
-        );
-        this.subscriptionId = null;
-      } catch (error) {
-        log.error("Failed to remove account change listener", error);
-      }
-    }
-    this.isActive = false;
-    await this.updateInDb();
-  }
-
-  async handleAccountChange(accountInfo, context) {
-    try {
-      log.tracker(this.walletAddress.toString(), "Processing account change", {
-        slot: context.slot,
-        lamports: accountInfo.lamports,
-      });
-
-      this.lastTransaction = context.slot.toString();
-      await this.updateInDb();
-
-      // Only scan tokens if enough time has passed since last scan and not currently scanning
-      const now = Date.now();
-      if (
-        !this.isScanning &&
-        now - this.lastScanTime >= RATE_LIMIT.SCAN_INTERVAL
-      ) {
-        await this.scanTokens();
-      }
-
-      await this.checkOpportunities();
-    } catch (error) {
-      log.error("Error handling account change", error);
     }
   }
 
   async scanTokens() {
     if (this.isScanning) {
-      log.tracker(
-        this.walletAddress.toString(),
-        "Token scan already in progress, skipping"
+      console.log(
+        `Scan already in progress for wallet: ${this.walletAddress.toString()}`
       );
       return;
     }
 
     this.isScanning = true;
+
     try {
-      log.tracker(this.walletAddress.toString(), "Starting token scan");
+      console.log(
+        `Scanning tokens for wallet: ${this.walletAddress.toString()}`
+      );
 
-      const scanTokens = async () => {
-        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
-          this.walletAddress,
-          { programId: TOKEN_PROGRAM_ID }
-        );
-        return tokenAccounts;
-      };
-
-      const tokenAccounts = await requestQueue.add(
-        () => scanTokens(),
-        false, // not priority
-        RATE_LIMIT.MAX_RETRIES
+      const tokenAccounts = await rateLimiter.enqueueRequest(() =>
+        connection.getParsedTokenAccountsByOwner(this.walletAddress, {
+          programId: TOKEN_PROGRAM_ID,
+        })
       );
 
       this.tokenHoldings.clear();
-      for (const { account, pubkey } of tokenAccounts.value) {
-        const { mint, amount, decimals } = account.data.parsed.info;
-        this.tokenHoldings.set(mint, {
-          amount: amount,
-          decimals: decimals,
-          address: pubkey.toBase58(),
-        });
 
-        log.tracker(this.walletAddress.toString(), "Token found", {
-          mint,
-          amount,
-          decimals,
-          address: pubkey.toBase58(),
-        });
+      // Process tokens in batches
+      const accounts = tokenAccounts.value;
+      for (let i = 0; i < accounts.length; i += RATE_LIMIT.BATCH_SIZE) {
+        const batch = accounts.slice(i, i + RATE_LIMIT.BATCH_SIZE);
+
+        console.log(
+          `Processing batch ${
+            Math.floor(i / RATE_LIMIT.BATCH_SIZE) + 1
+          } of ${Math.ceil(accounts.length / RATE_LIMIT.BATCH_SIZE)}`
+        );
+
+        for (const { account, pubkey } of batch) {
+          const parsedInfo = account.data.parsed.info;
+          if (parsedInfo.tokenAmount.uiAmount > 0) {
+            this.tokenHoldings.set(parsedInfo.mint, {
+              amount: parsedInfo.tokenAmount.amount,
+              uiAmount: parsedInfo.tokenAmount.uiAmount,
+              address: pubkey.toString(),
+            });
+
+            console.log(
+              `Found token: ${parsedInfo.mint} with amount: ${parsedInfo.tokenAmount.uiAmount}`
+            );
+          }
+        }
+
+        // Add delay between batches
+        await delay(RATE_LIMIT.BATCH_DELAY_MS);
       }
 
-      this.lastScanTime = Date.now();
-      log.tracker(this.walletAddress.toString(), "Token scan completed", {
-        tokenCount: this.tokenHoldings.size,
-      });
+      console.log(
+        `Found ${
+          this.tokenHoldings.size
+        } tokens for wallet: ${this.walletAddress.toString()}`
+      );
+
+      // Update database with latest scan
+      await this.updateDatabase();
     } catch (error) {
-      log.error("Error scanning tokens", error);
+      console.error(
+        `Error scanning tokens for ${this.walletAddress.toString()}:`,
+        error
+      );
     } finally {
       this.isScanning = false;
     }
   }
+
+  async handleAccountChange(accountInfo, context) {
+    try {
+      const now = Date.now();
+      const timeSinceLastChange = now - this.lastAccountChangeTime;
+
+      if (timeSinceLastChange < RATE_LIMIT.ACCOUNT_CHANGE_COOLDOWN_MS) {
+        console.log(
+          `Skipping account change processing - cooldown period (${Math.round(
+            (RATE_LIMIT.ACCOUNT_CHANGE_COOLDOWN_MS - timeSinceLastChange) / 1000
+          )}s remaining)`
+        );
+        return;
+      }
+
+      this.lastAccountChangeTime = now;
+      console.log(
+        `Account change detected for wallet: ${this.walletAddress.toString()}`
+      );
+
+      if (context.slot) {
+        const signatures = await rateLimiter.enqueueRequest(() =>
+          connection.getSignaturesForAddress(this.walletAddress, { limit: 1 })
+        );
+
+        if (signatures.length > 0) {
+          this.lastTransaction = signatures[0].signature;
+          await this.updateDatabase();
+
+          // Get transaction details
+          const txInfo = await rateLimiter.enqueueRequest(() =>
+            connection.getTransaction(this.lastTransaction, {
+              maxSupportedTransactionVersion: 0,
+            })
+          );
+
+          if (txInfo) {
+            await this.handleDexSwap(txInfo);
+          }
+        }
+      }
+
+      await this.scanTokens();
+    } catch (error) {
+      console.error(
+        `Error handling account change for ${this.walletAddress.toString()}:`,
+        error
+      );
+    }
+  }
+
+  async handleDexSwap(txInfo) {
+    try {
+      const programIds = txInfo.transaction.message.accountKeys.map((key) =>
+        key.toString()
+      );
+
+      const isDexSwap = Object.values(DEX_PROGRAMS).some((programId) =>
+        programIds.includes(programId)
+      );
+
+      if (!isDexSwap) {
+        return;
+      }
+
+      console.log(`DEX swap detected in transaction: ${this.lastTransaction}`);
+
+      // Analyze token balances before and after swap
+      const preTokenBalances = txInfo.meta.preTokenBalances || [];
+      const postTokenBalances = txInfo.meta.postTokenBalances || [];
+
+      // Find the token that was swapped
+      const changedBalances = this.analyzeBalanceChanges(
+        preTokenBalances,
+        postTokenBalances
+      );
+
+      if (changedBalances.length !== 2) {
+        console.log("Could not determine swap tokens");
+        return;
+      }
+
+      const [tokenIn, tokenOut] = changedBalances;
+      const isSellingToken =
+        tokenIn.mint !== SystemProgram.programId.toString();
+
+      if (isSellingToken) {
+        // User is selling a token for SOL
+        await this.mirrorTokenSale(tokenIn.mint, tokenIn.uiAmount);
+      } else {
+        // User is buying a token with SOL
+        await this.mirrorTokenPurchase(tokenOut.mint, tokenOut.uiAmount);
+      }
+    } catch (error) {
+      console.error("Error handling DEX swap:", error);
+    }
+  }
+
+  analyzeBalanceChanges(preBalances, postBalances) {
+    const changes = [];
+
+    // Create maps of pre and post balances
+    const preMap = new Map(
+      preBalances.map((b) => [b.mint, b.uiTokenAmount.uiAmount])
+    );
+    const postMap = new Map(
+      postBalances.map((b) => [b.mint, b.uiTokenAmount.uiAmount])
+    );
+
+    // Find decreased balance (sold token)
+    for (const [mint, preBal] of preMap) {
+      const postBal = postMap.get(mint) || 0;
+      if (postBal < preBal) {
+        changes.push({
+          mint,
+          uiAmount: preBal - postBal,
+          type: "decrease",
+        });
+      }
+    }
+
+    // Find increased balance (bought token)
+    for (const [mint, postBal] of postMap) {
+      const preBal = preMap.get(mint) || 0;
+      if (postBal > preBal) {
+        changes.push({
+          mint,
+          uiAmount: postBal - preBal,
+          type: "increase",
+        });
+      }
+    }
+
+    return changes;
+  }
+
+  async mirrorTokenSale(tokenMint, amount) {
+    try {
+      const tokenBalance = this.tokenHoldings.get(tokenMint);
+      if (!tokenBalance) {
+        console.log(`No balance found for token ${tokenMint}`);
+        return;
+      }
+
+      // Sell 100% of holdings instead of percentage
+      const amountToSell = tokenBalance.uiAmount;
+
+      // Get Jupiter quote for the swap
+      const jupiterQuote = await this.getJupiterQuote(
+        tokenMint,
+        "SOL",
+        amountToSell
+      );
+
+      if (!jupiterQuote) {
+        console.log("Could not get Jupiter quote for token sale");
+        return;
+      }
+
+      // Execute the swap
+      await this.executeJupiterSwap(jupiterQuote);
+
+      console.log(`Mirrored token sale for ${amountToSell} ${tokenMint}`);
+    } catch (error) {
+      console.error("Error mirroring token sale:", error);
+    }
+  }
+
+  async mirrorTokenPurchase(tokenMint, amount) {
+    try {
+      // Get main wallet SOL balance
+      const solBalance = await connection.getBalance(mainWallet.publicKey);
+
+      // Calculate SOL amount to use based on percentage
+      const solToUse =
+        (solBalance * this.solPercentage) / 100 / LAMPORTS_PER_SOL;
+
+      // Get Jupiter quote for the swap
+      const jupiterQuote = await this.getJupiterQuote(
+        "SOL",
+        tokenMint,
+        solToUse
+      );
+
+      if (!jupiterQuote) {
+        console.log("Could not get Jupiter quote for token purchase");
+        return;
+      }
+
+      // Execute the swap
+      await this.executeJupiterSwap(jupiterQuote);
+
+      console.log(`Mirrored token purchase with ${solToUse} SOL`);
+    } catch (error) {
+      console.error("Error mirroring token purchase:", error);
+    }
+  }
+
+  async getJupiterQuote(inputMint, outputMint, amount) {
+    try {
+      // Convert 'SOL' to native SOL mint address
+      const inputMintAddress =
+        inputMint === "SOL"
+          ? "So11111111111111111111111111111111111111112"
+          : inputMint;
+
+      const outputMintAddress =
+        outputMint === "SOL"
+          ? "So11111111111111111111111111111111111111112"
+          : outputMint;
+
+      // Convert amount to proper format (integer for lamports if SOL)
+      const adjustedAmount =
+        inputMint === "SOL"
+          ? Math.floor(amount * LAMPORTS_PER_SOL).toString()
+          : Math.floor(amount).toString();
+
+      console.log(`Requesting Jupiter quote:
+      Input: ${inputMint} (${inputMintAddress})
+      Output: ${outputMint} (${outputMintAddress})
+      Amount: ${amount} (adjusted: ${adjustedAmount})`);
+
+      const url =
+        `https://quote-api.jup.ag/v4/quote?` +
+        `inputMint=${inputMintAddress}&` +
+        `outputMint=${outputMintAddress}&` +
+        `amount=${adjustedAmount}&` +
+        `slippageBps=50`;
+
+      console.log("Request URL:", url);
+
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        if (response.status === 404) {
+          console.log("Jupiter quote not available, trying Raydium...");
+          return await this.getRaydiumQuote(
+            inputMintAddress,
+            outputMintAddress,
+            adjustedAmount
+          );
+        }
+        const errorText = await response.text();
+        console.error(`Jupiter API error (${response.status}):`, errorText);
+        throw new Error(
+          `Jupiter API error: ${response.statusText} (${response.status})\n${errorText}`
+        );
+      }
+
+      const data = await response.json();
+
+      if (!data || !data.data) {
+        console.error("Invalid Jupiter API response:", data);
+        throw new Error("Invalid response from Jupiter API");
+      }
+
+      console.log(`Successfully got Jupiter quote:
+      Input Amount: ${data.data.inputAmount}
+      Output Amount: ${data.data.outputAmount}
+      Price Impact: ${data.data.priceImpactPct}%`);
+
+      return {
+        ...data.data,
+        source: "jupiter",
+      };
+    } catch (error) {
+      console.error("Error getting Jupiter quote:", error);
+      if (error.response) {
+        try {
+          const errorBody = await error.response.text();
+          console.error("Response body:", errorBody);
+        } catch (e) {
+          console.error("Could not read error response body:", e);
+        }
+      }
+      return null;
+    }
+  }
+
+  async getRaydiumQuote(inputMint, outputMint, amount) {
+    try {
+      // Get pool information from Raydium
+      const poolResponse = await fetch("https://api.raydium.io/v2/main/pairs");
+      if (!poolResponse.ok) {
+        throw new Error(`Raydium API error: ${poolResponse.statusText}`);
+      }
+
+      const pools = await poolResponse.json();
+      const pool = pools.find(
+        (p) =>
+          (p.baseMint === inputMint && p.quoteMint === outputMint) ||
+          (p.baseMint === outputMint && p.quoteMint === inputMint)
+      );
+
+      if (!pool) {
+        console.log("No Raydium pool found for this pair");
+        return null;
+      }
+
+      // Use tokenAmountCoin and tokenAmountPc as reserves
+      if (!pool.tokenAmountCoin || !pool.tokenAmountPc) {
+        console.log("Invalid pool reserves:", pool);
+        return null;
+      }
+
+      // Convert floating point numbers to integers (multiply by 1e9 for 9 decimals precision)
+      const PRECISION = 1000000000;
+      const baseReserve = Math.floor(
+        parseFloat(pool.tokenAmountCoin) * PRECISION
+      ).toString();
+      const quoteReserve = Math.floor(
+        parseFloat(pool.tokenAmountPc) * PRECISION
+      ).toString();
+
+      // Calculate expected output based on pool data
+      const isBaseToQuote = pool.baseMint === inputMint;
+      const inputAmount = BigInt(amount);
+      const poolSupply = isBaseToQuote
+        ? BigInt(baseReserve)
+        : BigInt(quoteReserve);
+      const outputSupply = isBaseToQuote
+        ? BigInt(quoteReserve)
+        : BigInt(baseReserve);
+
+      // Simple constant product formula with 0.3% fee
+      const fee = (inputAmount * BigInt(3)) / BigInt(1000); // 0.3% fee
+      const inputWithFee = inputAmount - fee;
+      const outputAmount =
+        (inputWithFee * outputSupply) / (poolSupply + inputWithFee);
+
+      console.log(`Successfully got Raydium quote:
+      Input Amount: ${amount}
+      Output Amount: ${outputAmount.toString()}
+      Pool: ${pool.ammId}
+      Base Reserve: ${baseReserve}
+      Quote Reserve: ${quoteReserve}
+      Price: ${pool.price}`);
+
+      return {
+        inputAmount: amount,
+        outputAmount: outputAmount.toString(),
+        priceImpactPct: ((inputAmount * BigInt(100)) / poolSupply).toString(),
+        source: "raydium",
+        poolId: pool.ammId,
+      };
+    } catch (error) {
+      console.error("Error getting Raydium quote:", error);
+      if (error instanceof Error && error.message.includes("BigInt")) {
+        console.error("BigInt conversion error. Input values:", {
+          amount,
+          pool: pools?.find(
+            (p) =>
+              (p.baseMint === inputMint && p.quoteMint === outputMint) ||
+              (p.baseMint === outputMint && p.quoteMint === inputMint)
+          ),
+        });
+      }
+      return null;
+    }
+  }
+
+  async executeRaydiumSwap(quoteResponse) {
+    try {
+      console.log("Executing Raydium swap with quote:", quoteResponse);
+
+      // Get pool information
+      const poolResponse = await fetch("https://api.raydium.io/v2/main/pairs");
+      if (!poolResponse.ok) {
+        throw new Error("Failed to fetch pool information");
+      }
+
+      const pools = await poolResponse.json();
+      const pool = pools.find((p) => p.ammId === quoteResponse.poolId);
+
+      if (!pool) {
+        throw new Error("Pool not found");
+      }
+
+      // Validate pool data
+      const requiredFields = [
+        "ammId",
+        "ammAuthority",
+        "lpMint",
+        "lpVault",
+        "baseVault",
+        "quoteVault",
+        "feeAccount",
+      ];
+
+      const missingFields = requiredFields.filter((field) => !pool[field]);
+      if (missingFields.length > 0) {
+        console.error(
+          "Pool data validation failed. Missing fields:",
+          missingFields
+        );
+        console.error("Pool data:", pool);
+        throw new Error(
+          `Missing required pool fields: ${missingFields.join(", ")}`
+        );
+      }
+
+      // Create transaction
+      const transaction = new Transaction();
+
+      // Get or create associated token accounts
+      const inputMint = new PublicKey(pool.baseMint);
+      const outputMint = new PublicKey(pool.quoteMint);
+
+      const inputATA = await getAssociatedTokenAddress(
+        inputMint,
+        mainWallet.publicKey
+      );
+
+      const outputATA = await getAssociatedTokenAddress(
+        outputMint,
+        mainWallet.publicKey
+      );
+
+      // Check if ATAs exist, if not create them
+      try {
+        await connection.getAccountInfo(inputATA);
+      } catch {
+        transaction.add(
+          createAssociatedTokenAccountInstruction(
+            mainWallet.publicKey,
+            inputATA,
+            mainWallet.publicKey,
+            inputMint
+          )
+        );
+      }
+
+      try {
+        await connection.getAccountInfo(outputATA);
+      } catch {
+        transaction.add(
+          createAssociatedTokenAccountInstruction(
+            mainWallet.publicKey,
+            outputATA,
+            mainWallet.publicKey,
+            outputMint
+          )
+        );
+      }
+
+      // Add Raydium swap instruction
+      const RAYDIUM_PROGRAM_ID = new PublicKey(
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+      );
+
+      console.log("Creating pool account PublicKeys with data:", {
+        ammId: pool.ammId,
+        ammAuthority: pool.ammAuthority,
+        lpMint: pool.lpMint,
+        lpVault: pool.lpVault,
+        baseVault: pool.baseVault,
+        quoteVault: pool.quoteVault,
+        feeAccount: pool.feeAccount,
+      });
+
+      // Get all the required pool accounts
+      const ammId = new PublicKey(pool.ammId);
+      const ammAuthority = new PublicKey(pool.ammAuthority);
+      const poolTokenMint = new PublicKey(pool.lpMint);
+      const poolTokenVault = new PublicKey(pool.lpVault);
+      const baseTokenVault = new PublicKey(pool.baseVault);
+      const quoteTokenVault = new PublicKey(pool.quoteVault);
+      const feeAccount = new PublicKey(pool.feeAccount);
+
+      const swapInstruction = new TransactionInstruction({
+        programId: RAYDIUM_PROGRAM_ID,
+        keys: [
+          // AMM accounts
+          { pubkey: ammId, isSigner: false, isWritable: true },
+          { pubkey: ammAuthority, isSigner: false, isWritable: false },
+          { pubkey: mainWallet.publicKey, isSigner: true, isWritable: false },
+          { pubkey: poolTokenMint, isSigner: false, isWritable: true },
+          { pubkey: poolTokenVault, isSigner: false, isWritable: true },
+          { pubkey: baseTokenVault, isSigner: false, isWritable: true },
+          { pubkey: quoteTokenVault, isSigner: false, isWritable: true },
+          { pubkey: feeAccount, isSigner: false, isWritable: true },
+
+          // User accounts
+          { pubkey: inputATA, isSigner: false, isWritable: true },
+          { pubkey: outputATA, isSigner: false, isWritable: true },
+
+          // Program IDs
+          { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        ],
+        data: Buffer.from([
+          2, // Swap instruction
+          ...new Uint8Array(
+            new BigInt64Array([BigInt(quoteResponse.inputAmount)]).buffer
+          ),
+          ...new Uint8Array(
+            new BigInt64Array([
+              BigInt(Math.floor(Number(quoteResponse.outputAmount) * 0.995)),
+            ]).buffer
+          ), // Minimum output with 0.5% slippage
+        ]),
+      });
+
+      transaction.add(swapInstruction);
+
+      // Set recent blockhash and sign transaction
+      const { blockhash, lastValidBlockHeight } =
+        await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.lastValidBlockHeight = lastValidBlockHeight;
+      transaction.feePayer = mainWallet.publicKey;
+
+      transaction.sign(mainWallet);
+
+      // Send transaction
+      const txid = await rateLimiter.enqueueRequest(() =>
+        connection.sendRawTransaction(transaction.serialize(), {
+          skipPreflight: true,
+        })
+      );
+
+      console.log(`Raydium swap transaction sent: ${txid}`);
+
+      // Wait for confirmation with retries
+      let confirmed = false;
+      let retries = 0;
+
+      while (!confirmed && retries < RATE_LIMIT.MAX_RETRIES) {
+        try {
+          console.log(
+            `Retry ${retries + 1}/${
+              RATE_LIMIT.MAX_RETRIES
+            } confirming transaction ${txid}`
+          );
+          await rateLimiter.enqueueRequest(() =>
+            connection.confirmTransaction({
+              signature: txid,
+              blockhash: blockhash,
+              lastValidBlockHeight: lastValidBlockHeight,
+            })
+          );
+          confirmed = true;
+          console.log(`Raydium swap transaction confirmed: ${txid}`);
+        } catch (error) {
+          retries++;
+          if (retries === RATE_LIMIT.MAX_RETRIES) {
+            throw error;
+          }
+          await delay(1000); // Wait 1 second before retrying
+        }
+      }
+
+      return txid;
+    } catch (error) {
+      console.error("Error executing Raydium swap:", error);
+      if (error.response) {
+        try {
+          const errorBody = await error.response.text();
+          console.error("Raydium API error response:", errorBody);
+        } catch (e) {
+          console.error("Could not read error response body:", e);
+        }
+      }
+      throw error;
+    }
+  }
+
+  async updateDatabase() {
+    try {
+      const { error } = await supabase
+        .from("trackers")
+        .update({
+          last_transaction: this.lastTransaction,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", this.id);
+
+      if (error) {
+        throw error;
+      }
+    } catch (error) {
+      console.error(`Error updating database for tracker ${this.id}:`, error);
+    }
+  }
+
+  cleanup() {
+    if (this.accountSubscription) {
+      connection.removeAccountChangeListener(this.accountSubscription);
+      this.accountSubscription = null;
+    }
+  }
 }
 
-// Load existing trackers from database on startup
-async function loadTrackers() {
+async function initializeTrackers() {
   try {
+    console.log("Initializing all active trackers...");
+
+    // Fetch all active trackers from database
     const { data: trackers, error } = await supabase
       .from("trackers")
       .select("*")
       .eq("is_active", true);
 
     if (error) {
-      log.error("Error loading trackers from database", error);
-      return;
+      throw error;
     }
 
-    log.info("Loading trackers from database", { count: trackers.length });
+    // Clear existing trackers
+    for (const tracker of activeTrackers.values()) {
+      tracker.cleanup();
+    }
+    activeTrackers.clear();
 
+    // Initialize new trackers
     for (const tracker of trackers) {
-      const walletTracker = new WalletTracker(
-        tracker.id,
-        tracker.wallet_address,
-        tracker.sol_percentage
-      );
-      await walletTracker.startTracking();
-      activeTrackers.set(tracker.wallet_address, walletTracker);
+      try {
+        const walletTracker = new WalletTracker(
+          tracker.id,
+          tracker.wallet_address,
+          tracker.sol_percentage
+        );
+
+        await walletTracker.initialize();
+        activeTrackers.set(tracker.id, walletTracker);
+
+        console.log(`Tracker ${tracker.id} initialized successfully`);
+      } catch (error) {
+        console.error(`Failed to initialize tracker ${tracker.id}:`, error);
+      }
     }
 
-    log.info("Trackers loaded and started", {
-      activeTrackerCount: activeTrackers.size,
-    });
+    console.log(`Initialized ${activeTrackers.size} trackers`);
   } catch (error) {
-    log.error("Failed to load trackers", error);
+    console.error("Error initializing trackers:", error);
   }
 }
 
-// Load trackers on startup
-loadTrackers();
-
-// Health check endpoint for Render
+// Health check endpoint
 app.get("/health", (req, res) => {
-  res.status(200).json({
+  res.json({
     status: "healthy",
-    timestamp: new Date().toISOString(),
     activeTrackers: activeTrackers.size,
+    rateLimiterStatus: {
+      availableTokens: Math.floor(rateLimiter.tokens),
+      queueLength: rateLimiter.requestQueue.length,
+    },
   });
 });
 
-// Keep-alive endpoint
-app.get("/keep-alive", (req, res) => {
-  res.status(200).json({
-    status: "alive",
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// API Routes
-app.post("/api/trackers", async (req, res) => {
-  try {
-    const { walletAddress, solPercentage } = req.body;
-
-    if (!walletAddress || !solPercentage) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    // Insert into database first
-    const { data: tracker, error } = await supabase
-      .from("trackers")
-      .insert({
-        wallet_address: walletAddress,
-        sol_percentage: solPercentage,
-        is_active: true,
-      })
-      .select()
-      .single();
-
-    if (error) {
-      throw error;
-    }
-
-    // Create and start tracker
-    const walletTracker = new WalletTracker(
-      tracker.id,
-      walletAddress,
-      solPercentage
-    );
-    await walletTracker.startTracking();
-    activeTrackers.set(walletAddress, walletTracker);
-
-    res.status(201).json(tracker);
-  } catch (error) {
-    console.error("Error creating tracker:", error);
-    res.status(500).json({ error: "Failed to create tracker" });
-  }
-});
-
-app.get("/api/trackers", async (req, res) => {
-  try {
-    const { data: trackers, error } = await supabase
-      .from("trackers")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      throw error;
-    }
-
-    res.json(trackers);
-  } catch (error) {
-    console.error("Error fetching trackers:", error);
-    res.status(500).json({ error: "Failed to fetch trackers" });
-  }
-});
-
-app.patch("/api/trackers/:address", async (req, res) => {
-  try {
-    const { address } = req.params;
-    const tracker = activeTrackers.get(address);
-    const { isActive, solPercentage } = req.body;
-
-    // Update database
-    const { data: updatedTracker, error } = await supabase
-      .from("trackers")
-      .update({
-        is_active: isActive,
-        sol_percentage: solPercentage,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("wallet_address", address)
-      .select()
-      .single();
-
-    if (error) {
-      throw error;
-    }
-
-    // Update memory tracker
-    if (tracker) {
-      if (isActive !== undefined) {
-        if (isActive) {
-          tracker.startTracking();
-        } else {
-          tracker.stopTracking();
-        }
-        tracker.isActive = isActive;
-      }
-
-      if (solPercentage !== undefined) {
-        tracker.solPercentage = solPercentage;
-      }
-    }
-
-    res.json(updatedTracker);
-  } catch (error) {
-    console.error("Error updating tracker:", error);
-    res.status(500).json({ error: "Failed to update tracker" });
-  }
-});
-
-app.delete("/api/trackers/:address", async (req, res) => {
-  try {
-    const { address } = req.params;
-    const tracker = activeTrackers.get(address);
-
-    // Delete from database
-    const { error } = await supabase
-      .from("trackers")
-      .delete()
-      .eq("wallet_address", address);
-
-    if (error) {
-      throw error;
-    }
-
-    // Stop and remove from memory
-    if (tracker) {
-      tracker.stopTracking();
-      activeTrackers.delete(address);
-    }
-
-    res.status(204).send();
-  } catch (error) {
-    console.error("Error deleting tracker:", error);
-    res.status(500).json({ error: "Failed to delete tracker" });
-  }
-});
-
+// Initialize trackers and start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+
+async function startServer() {
+  try {
+    await initializeTrackers();
+
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+
+    // Reinitialize trackers every hour to ensure everything is in sync
+    setInterval(initializeTrackers, 60 * 60 * 1000);
+  } catch (error) {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  }
+}
+
+startServer();
